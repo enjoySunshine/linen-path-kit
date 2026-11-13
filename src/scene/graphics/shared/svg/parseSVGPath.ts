@@ -1,4 +1,3 @@
-import parse from 'parse-svg-path';
 import { warn } from '../../../../utils/logging/warn';
 
 import type { GraphicsPath } from '../path/GraphicsPath';
@@ -9,11 +8,31 @@ interface SubPath
     startY: number;
 }
 
+// char codes used by the scanner
+const TAB = 0x09;
+const CR = 0x0D;
+const SPACE = 0x20;
+const PLUS = 0x2B;
+const COMMA = 0x2C;
+const MINUS = 0x2D;
+const DOT = 0x2E;
+const ZERO = 0x30;
+const NINE = 0x39;
+const UPPER_A = 0x41;
+const UPPER_E = 0x45;
+const UPPER_Z = 0x5A;
+const LOWER_A = 0x61;
+const LOWER_E = 0x65;
+const LOWER_Z = 0x7A;
+
 /**
  * Parses an SVG path data string and builds a GraphicsPath object from the commands.
  * This function handles all standard SVG path commands including moves, lines, curves and arcs.
  * It maintains state for the current position and subpaths to properly handle relative commands
  * and path closures.
+ *
+ * The string is scanned in a single pass without allocating intermediate command arrays,
+ * which keeps parsing fast even for paths with tens of thousands of segments.
  *
  * Supported SVG commands:
  * - M/m: Move to absolute/relative
@@ -33,8 +52,7 @@ interface SubPath
  */
 export function parseSVGPath(svgPath: string, path: GraphicsPath): GraphicsPath
 {
-    // Parse the SVG path string into an array of commands
-    const commands = parse(svgPath);
+    const length = svgPath.length;
 
     // Track subpaths for proper path closure handling
     const subpaths: SubPath[] = [];
@@ -44,159 +62,415 @@ export function parseSVGPath(svgPath: string, path: GraphicsPath): GraphicsPath
     let lastX = 0;
     let lastY = 0;
 
-    // Process each command in sequence
-    for (let i = 0; i < commands.length; i++)
+    // The char code of the command currently being applied. Successive parameter sets
+    // repeat the previous command without restating the letter (per the SVG spec)
+    let command = 0;
+
+    // Current scan position within the path string
+    let i = 0;
+
+    // moveTo/lineTo instructions are pushed directly for speed; moveTo does not mark the
+    // path dirty, everything else does (mirroring the GraphicsPath methods)
+    const instructions = path.instructions;
+    let dirty = false;
+
+    // Skips over whitespace and commas between tokens
+    const skipSeparators = (): void =>
     {
-        const command = commands[i];
-        const type = command[0]; // The command letter
-        const data = command; // The command parameters, 1-based indexed
-
-        switch (type)
+        while (i < length)
         {
-            case 'M': // Move To (absolute)
-                lastX = data[1];
-                lastY = data[2];
+            const code = svgPath.charCodeAt(i);
 
-                path.moveTo(lastX, lastY);
+            // comma, or whitespace: tab, LF, FF, CR, space
+            if (code === COMMA || code === SPACE || (code >= TAB && code <= CR))
+            {
+                i++;
+            }
+            else
+            {
                 break;
-            case 'm': // Move To (relative)
-                lastX += data[1];
-                lastY += data[2];
+            }
+        }
+    };
 
-                path.moveTo(lastX, lastY);
-                break;
-            case 'H': // Horizontal Line To (absolute)
-                lastX = data[1];
+    // Reads a single number at the scan position, handling signs,
+    // decimals and scientific notation without allocating substrings
+    const readNumber = (): number =>
+    {
+        let code = svgPath.charCodeAt(i);
 
-                path.lineTo(lastX, lastY);
-                break;
-            case 'h': // Horizontal Line To (relative)
-                lastX += data[1];
+        // skip separators - a single space is by far the most common case
+        if (code === SPACE)
+        {
+            i++;
+            code = svgPath.charCodeAt(i);
+        }
 
-                path.lineTo(lastX, lastY);
-                break;
-            case 'V': // Vertical Line To (absolute)
-                lastY = data[1];
+        if (code === COMMA || code === SPACE || (code >= TAB && code <= CR))
+        {
+            skipSeparators();
+            code = svgPath.charCodeAt(i);
+        }
 
-                path.lineTo(lastX, lastY);
-                break;
-            case 'v': // Vertical Line To (relative)
-                lastY += data[1];
+        let sign = 1;
 
-                path.lineTo(lastX, lastY);
-                break;
-            case 'L': // Line To (absolute)
-                lastX = data[1];
-                lastY = data[2];
+        if (code === PLUS)
+        {
+            i++;
+        }
+        else if (code === MINUS)
+        {
+            sign = -1;
+            i++;
+        }
 
-                path.lineTo(lastX, lastY);
-                break;
-            case 'l': // Line To (relative)
-                lastX += data[1];
-                lastY += data[2];
+        let value = 0;
+        let hasDigits = false;
 
-                path.lineTo(lastX, lastY);
+        // integer part
+        while (i < length)
+        {
+            code = svgPath.charCodeAt(i);
+            if (code < ZERO || code > NINE) break;
+            value = (value * 10) + (code - ZERO);
+            i++;
+            hasDigits = true;
+        }
+
+        // fractional part - accumulated into the same integer, then scaled down
+        if (svgPath.charCodeAt(i) === DOT)
+        {
+            i++;
+
+            let divisor = 1;
+
+            while (i < length)
+            {
+                code = svgPath.charCodeAt(i);
+                if (code < ZERO || code > NINE) break;
+                value = (value * 10) + (code - ZERO);
+                divisor *= 10;
+                i++;
+                hasDigits = true;
+            }
+
+            value /= divisor;
+        }
+
+        if (!hasDigits)
+        {
+            throw new Error('malformed path data');
+        }
+
+        // exponent, e.g. "1e-3" - only consumed when at least one digit follows
+        code = svgPath.charCodeAt(i);
+
+        if (code === LOWER_E || code === UPPER_E)
+        {
+            let j = i + 1;
+            let expSign = 1;
+
+            code = svgPath.charCodeAt(j);
+
+            if (code === MINUS)
+            {
+                expSign = -1;
+                j++;
+            }
+            else if (code === PLUS)
+            {
+                j++;
+            }
+
+            code = svgPath.charCodeAt(j);
+
+            if (code >= ZERO && code <= NINE)
+            {
+                let exp = 0;
+
+                while (j < length)
+                {
+                    code = svgPath.charCodeAt(j);
+                    if (code < ZERO || code > NINE) break;
+                    exp = (exp * 10) + (code - ZERO);
+                    j++;
+                }
+
+                value *= 10 ** (expSign * exp);
+                i = j;
+            }
+        }
+
+        return sign * value;
+    };
+
+    // Advances the scan position to the next command letter.
+    // Used to skip over data that cannot be processed
+    const skipToNextCommand = (): void =>
+    {
+        while (i < length)
+        {
+            const code = svgPath.charCodeAt(i);
+
+            if ((code >= UPPER_A && code <= UPPER_Z) || (code >= LOWER_A && code <= LOWER_Z)) break;
+            i++;
+        }
+    };
+
+    // Process each command in sequence
+    while (i < length)
+    {
+        let code = svgPath.charCodeAt(i);
+
+        // skip separators - a single space is by far the most common case
+        if (code === SPACE)
+        {
+            i++;
+            code = svgPath.charCodeAt(i);
+        }
+
+        if (code === COMMA || code === SPACE || (code >= TAB && code <= CR))
+        {
+            skipSeparators();
+            code = svgPath.charCodeAt(i);
+        }
+
+        if (i >= length) break;
+
+        if ((code >= UPPER_A && code <= UPPER_Z) || (code >= LOWER_A && code <= LOWER_Z))
+        {
+            command = code;
+            i++;
+        }
+        else if (command === 0)
+        {
+            // data found before any command letter - ignore it
+            // #if _DEBUG
+            warn(`Malformed SVG path data: ${svgPath}`);
+            // #endif
+            skipToNextCommand();
+            continue;
+        }
+
+        // close path commands and unknown commands do not start a new subpath
+        let shouldTrackSubPath = command !== 90 && command !== 122;
+
+        switch (command)
+        {
+            case 77: // 'M' - Move To (absolute)
+                lastX = readNumber();
+                lastY = readNumber();
+
+                instructions.push({ action: 'moveTo', data: [lastX, lastY] });
+
+                // subsequent coordinate pairs are treated as implicit lineTo commands
+                command = 76; // 'L'
                 break;
-            case 'C': // Cubic Bezier Curve (absolute)
-                lastX = data[5];
-                lastY = data[6];
+            case 109: // 'm' - Move To (relative)
+                lastX += readNumber();
+                lastY += readNumber();
+
+                instructions.push({ action: 'moveTo', data: [lastX, lastY] });
+
+                // subsequent coordinate pairs are treated as implicit relative lineTo commands
+                command = 108; // 'l'
+                break;
+            case 72: // 'H' - Horizontal Line To (absolute)
+                lastX = readNumber();
+
+                instructions.push({ action: 'lineTo', data: [lastX, lastY] });
+                dirty = true;
+                break;
+            case 104: // 'h' - Horizontal Line To (relative)
+                lastX += readNumber();
+
+                instructions.push({ action: 'lineTo', data: [lastX, lastY] });
+                dirty = true;
+                break;
+            case 86: // 'V' - Vertical Line To (absolute)
+                lastY = readNumber();
+
+                instructions.push({ action: 'lineTo', data: [lastX, lastY] });
+                dirty = true;
+                break;
+            case 118: // 'v' - Vertical Line To (relative)
+                lastY += readNumber();
+
+                instructions.push({ action: 'lineTo', data: [lastX, lastY] });
+                dirty = true;
+                break;
+            case 76: // 'L' - Line To (absolute)
+                lastX = readNumber();
+                lastY = readNumber();
+
+                instructions.push({ action: 'lineTo', data: [lastX, lastY] });
+                dirty = true;
+                break;
+            case 108: // 'l' - Line To (relative)
+                lastX += readNumber();
+                lastY += readNumber();
+
+                instructions.push({ action: 'lineTo', data: [lastX, lastY] });
+                dirty = true;
+                break;
+            case 67: // 'C' - Cubic Bezier Curve (absolute)
+            {
+                const cp1x = readNumber();
+                const cp1y = readNumber();
+                const cp2x = readNumber();
+                const cp2y = readNumber();
+
+                lastX = readNumber();
+                lastY = readNumber();
 
                 path.bezierCurveTo(
-                    data[1], data[2], // First control point
-                    data[3], data[4], // Second control point
+                    cp1x, cp1y, // First control point
+                    cp2x, cp2y, // Second control point
                     lastX, lastY // End point
                 );
                 break;
-            case 'c': // Cubic Bezier Curve (relative)
+            }
+            case 99: // 'c' - Cubic Bezier Curve (relative)
+            {
+                const cp1x = readNumber();
+                const cp1y = readNumber();
+                const cp2x = readNumber();
+                const cp2y = readNumber();
+                const x = readNumber();
+                const y = readNumber();
+
                 path.bezierCurveTo(
-                    lastX + data[1], lastY + data[2], // First control point
-                    lastX + data[3], lastY + data[4], // Second control point
-                    lastX + data[5], lastY + data[6] // End point
+                    lastX + cp1x, lastY + cp1y, // First control point
+                    lastX + cp2x, lastY + cp2y, // Second control point
+                    lastX + x, lastY + y // End point
                 );
 
-                lastX += data[5];
-                lastY += data[6];
+                lastX += x;
+                lastY += y;
                 break;
-            case 'S': // Smooth Cubic Bezier Curve (absolute)
-                lastX = data[3];
-                lastY = data[4];
+            }
+            case 83: // 'S' - Smooth Cubic Bezier Curve (absolute)
+            {
+                const cp2x = readNumber();
+                const cp2y = readNumber();
+
+                lastX = readNumber();
+                lastY = readNumber();
 
                 path.bezierCurveToShort(
-                    data[1], data[2], // Control point
+                    cp2x, cp2y, // Control point
                     lastX, lastY // End point
                 );
                 break;
-            case 's': // Smooth Cubic Bezier Curve (relative)
+            }
+            case 115: // 's' - Smooth Cubic Bezier Curve (relative)
+            {
+                const cp2x = readNumber();
+                const cp2y = readNumber();
+                const x = readNumber();
+                const y = readNumber();
+
                 path.bezierCurveToShort(
-                    lastX + data[1], lastY + data[2], // Control point
-                    lastX + data[3], lastY + data[4], // End point
+                    lastX + cp2x, lastY + cp2y, // Control point
+                    lastX + x, lastY + y // End point
                 );
 
-                lastX += data[3];
-                lastY += data[4];
+                lastX += x;
+                lastY += y;
                 break;
-            case 'Q': // Quadratic Bezier Curve (absolute)
-                lastX = data[3];
-                lastY = data[4];
+            }
+            case 81: // 'Q' - Quadratic Bezier Curve (absolute)
+            {
+                const cpx = readNumber();
+                const cpy = readNumber();
+
+                lastX = readNumber();
+                lastY = readNumber();
 
                 path.quadraticCurveTo(
-                    data[1], data[2], // Control point
+                    cpx, cpy, // Control point
                     lastX, lastY // End point
                 );
                 break;
-            case 'q': // Quadratic Bezier Curve (relative)
+            }
+            case 113: // 'q' - Quadratic Bezier Curve (relative)
+            {
+                const cpx = readNumber();
+                const cpy = readNumber();
+                const x = readNumber();
+                const y = readNumber();
+
                 path.quadraticCurveTo(
-                    lastX + data[1], lastY + data[2], // Control point
-                    lastX + data[3], lastY + data[4] // End point
+                    lastX + cpx, lastY + cpy, // Control point
+                    lastX + x, lastY + y // End point
                 );
 
-                lastX += data[3];
-                lastY += data[4];
+                lastX += x;
+                lastY += y;
                 break;
-            case 'T': // Smooth Quadratic Bezier Curve (absolute)
-                lastX = data[1];
-                lastY = data[2];
+            }
+            case 84: // 'T' - Smooth Quadratic Bezier Curve (absolute)
+                lastX = readNumber();
+                lastY = readNumber();
 
                 path.quadraticCurveToShort(
                     lastX, lastY // End point
                 );
                 break;
-            case 't': // Smooth Quadratic Bezier Curve (relative)
-                lastX += data[1];
-                lastY += data[2];
+            case 116: // 't' - Smooth Quadratic Bezier Curve (relative)
+                lastX += readNumber();
+                lastY += readNumber();
 
                 path.quadraticCurveToShort(
                     lastX, lastY // End point
                 );
                 break;
-            case 'A': // Arc (absolute)
-                lastX = data[6];
-                lastY = data[7];
+            case 65: // 'A' - Arc (absolute)
+            {
+                const rx = readNumber();
+                const ry = readNumber();
+                const xAxisRotation = readNumber();
+                const largeArcFlag = readNumber();
+                const sweepFlag = readNumber();
+
+                lastX = readNumber();
+                lastY = readNumber();
 
                 path.arcToSvg(
-                    data[1], // rx
-                    data[2], // ry
-                    data[3], // x-axis-rotation
-                    data[4], // large-arc-flag
-                    data[5], // sweep-flag
+                    rx,
+                    ry,
+                    xAxisRotation,
+                    largeArcFlag,
+                    sweepFlag,
                     lastX, lastY // End point
                 );
                 break;
-            case 'a': // Arc (relative)
-                lastX += data[6];
-                lastY += data[7];
+            }
+            case 97: // 'a' - Arc (relative)
+            {
+                const rx = readNumber();
+                const ry = readNumber();
+                const xAxisRotation = readNumber();
+                const largeArcFlag = readNumber();
+                const sweepFlag = readNumber();
+                const x = readNumber();
+                const y = readNumber();
+
+                lastX += x;
+                lastY += y;
 
                 path.arcToSvg(
-                    data[1], // rx
-                    data[2], // ry
-                    data[3], // x-axis-rotation
-                    data[4], // large-arc-flag
-                    data[5], // sweep-flag
+                    rx,
+                    ry,
+                    xAxisRotation,
+                    largeArcFlag,
+                    sweepFlag,
                     lastX, lastY // End point
                 );
                 break;
-            case 'Z': // Close Path
-            case 'z':
+            }
+            case 90: // 'Z' - Close Path
+            case 122: // 'z'
                 path.closePath();
                 if (subpaths.length > 0)
                 {
@@ -214,22 +488,33 @@ export function parseSVGPath(svgPath: string, path: GraphicsPath): GraphicsPath
                     }
                 }
                 currentSubPath = null;
+
+                // a close path command takes no parameters, so it cannot be repeated implicitly
+                command = 0;
                 break;
             default:
                 // #if _DEBUG
-                warn(`Unknown SVG path command: ${type}`);
+                warn(`Unknown SVG path command: ${String.fromCharCode(command)}`);
                 // #endif
+                // ignore any parameters belonging to the unknown command
+                skipToNextCommand();
+                command = 0;
+                shouldTrackSubPath = false;
+                break;
         }
 
         // Track subpath starts for path closure
-        if (type !== 'Z' && type !== 'z')
+        if (shouldTrackSubPath && currentSubPath === null)
         {
-            if (currentSubPath === null)
-            {
-                currentSubPath = { startX: lastX, startY: lastY };
-                subpaths.push(currentSubPath);
-            }
+            currentSubPath = { startX: lastX, startY: lastY };
+            subpaths.push(currentSubPath);
         }
+    }
+
+    if (dirty)
+    {
+        // mirror the GraphicsPath methods, which mark the path as out of date
+        (path as unknown as { _dirty: boolean })._dirty = true;
     }
 
     return path;
